@@ -42,7 +42,8 @@ Optional (for fingerprint matching):
 Usage:
     python find_music_duplicates.py                    # normal run
     python find_music_duplicates.py --dry-run          # preview only
-    python find_music_duplicates.py --clear-cache      # delete cache and start fresh
+    python find_music_duplicates.py --clear-cache      # delete metadata cache and start fresh
+    python find_music_duplicates.py --clear-fp-cache   # delete fingerprint cache and regenerate
     python find_music_duplicates.py --clear-resume     # discard saved resume state
     python find_music_duplicates.py --config my.json   # use a custom config file
 """
@@ -97,9 +98,10 @@ except ImportError:
 
 DEFAULT_CONFIG_FILE = "music_config.json"
 SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".aac", ".m4a"}
-DRY_RUN       = "--dry-run"      in sys.argv
-CLEAR_CACHE   = "--clear-cache"  in sys.argv
-CLEAR_RESUME  = "--clear-resume" in sys.argv
+DRY_RUN          = "--dry-run"         in sys.argv
+CLEAR_CACHE      = "--clear-cache"     in sys.argv
+CLEAR_RESUME     = "--clear-resume"    in sys.argv
+CLEAR_FP_CACHE   = "--clear-fp-cache"  in sys.argv
 
 # Parse --config flag
 _cfg_flag = next((sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--config" and i + 1 < len(sys.argv)), None)
@@ -631,6 +633,64 @@ def prompt_selection(label: str, items: list) -> set[int]:
             print("  Please enter y or n.")
 
 
+def prompt_fp_tiered_selection(label: str, all_items: list, fp_indices: list[int]) -> set[int]:
+    """
+    Present fingerprint matches in three confidence tiers, each with its own
+    Notepad review list. Returns a set of indices into all_items that were selected.
+
+    Tiers:
+      HIGH   95–100%  — almost certainly the same audio
+      MEDIUM 90–94%   — very likely duplicates, quick review recommended
+      LOW    85–89%   — most scrutiny needed, false positives possible here
+    """
+    TIERS = [
+        (95, 100, "HIGH CONFIDENCE   (95–100% match)"),
+        (90, 94,  "MEDIUM CONFIDENCE (90–94% match)"),
+        (85, 89,  "LOW CONFIDENCE    (85–89% match) — review carefully"),
+    ]
+
+    selected_originals: set[int] = set()
+
+    for low, high, tier_label in TIERS:
+        # Collect items in this tier with their original index in all_items
+        tier_items   = []  # list of (original_index, item)
+        for orig_idx in fp_indices:
+            item  = all_items[orig_idx]
+            score = item.get("fp_score", 0)
+            if low <= score <= high:
+                tier_items.append((orig_idx, item))
+
+        if not tier_items:
+            continue
+
+        # Build a sub-list for Notepad (items only, no indices)
+        sub_items = [t[1] for t in tier_items]
+        content   = build_notepad_list(
+            f"{label} — {tier_label}",
+            sub_items,
+            f"Fingerprint confidence: {low}–{high}%  |  {len(sub_items)} file(s)",
+            DRY_RUN,
+        )
+        tmp = open_in_notepad(content)
+        print(f"\n  {tier_label}: {len(sub_items)} file(s) — opened in Notepad.")
+
+        selected_sub = prompt_selection(
+            f"Select files to move ({tier_label}):",
+            sub_items,
+        )
+
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+        # Map sub-list indices back to original all_items indices
+        for sub_idx in selected_sub:
+            selected_originals.add(tier_items[sub_idx][0])
+
+    return selected_originals
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  FILE MOVING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -709,7 +769,11 @@ def process_batch(items, selected_indices, dest_folder, unsorted, log, move_labe
             if resume_state is not None:
                 resume_state["processed"].add(str(u["path"]))
                 save_resume(
-                    {"processed": list(resume_state["processed"]), "mode": resume_state["mode"]},
+                    {
+                        "processed":    list(resume_state["processed"]),
+                        "fp_processed": list(resume_state.get("fp_processed", set())),
+                        "mode":         resume_state["mode"],
+                    },
                     RESUME_FILE,
                 )
 
@@ -780,41 +844,78 @@ def fingerprint_similarity(fp1: str, fp2: str) -> float:
         return 0.0
 
 
-def build_fp_index(organized_files: list, fpcalc_path: str, fp_cache: dict) -> list[dict]:
+# Minimum number of 32-bit integers a fingerprint must contain to be valid.
+# A 30-second audio clip produces ~120 integers. Files with fewer than this
+# are corrupted, silent, or too short to fingerprint reliably.
+FP_MIN_LENGTH = 50
+
+
+def is_valid_fingerprint(fp: str) -> bool:
+    """Return True if the fingerprint has enough data to be reliable."""
+    try:
+        return len(fp.split(",")) >= FP_MIN_LENGTH
+    except Exception:
+        return False
+
+
+def build_fp_index(organized_files: list, fpcalc_path: str, fp_cache: dict) -> tuple[list, list]:
     """
     Generate (or load from cache) fingerprints for all organized files.
-    Returns a list of {file, fingerprint} dicts.
+    Returns (index, warnings) where:
+      index    = list of {file, fingerprint} dicts for valid files
+      warnings = list of (path_str, reason) for skipped files
     """
-    index = []
-    pbar  = make_pbar(len(organized_files), "Fingerprinting library", "file")
+    index    = []
+    warnings = []
+    pbar     = make_pbar(len(organized_files), "Fingerprinting library", "file")
 
     for f in organized_files:
         path_str = str(f["path"])
         fp = fp_cache.get(path_str) or get_fingerprint(f["path"], fpcalc_path)
+
         if fp:
-            fp_cache[path_str] = fp
-            index.append({"file": f, "fingerprint": fp})
+            if is_valid_fingerprint(fp):
+                fp_cache[path_str] = fp
+                index.append({"file": f, "fingerprint": fp})
+            else:
+                # Store in cache so we don't re-generate, but flag as degenerate
+                fp_cache[path_str] = fp
+                warnings.append((path_str, f"short fingerprint ({len(fp.split(','))} integers) — file may be corrupted or silent"))
+        else:
+            warnings.append((path_str, "fingerprint generation failed"))
+
         pbar.update(1)
 
     pbar.close()
-    return index
+    return index, warnings
+
+
+# If a single organized library file matches this many unsorted files,
+# its fingerprint is likely degenerate and it's flagged in the log.
+FP_HIGH_FREQ_THRESHOLD = 5
 
 
 def fingerprint_pass(no_match_items: list, org_fp_index: list, fpcalc_path: str,
-                     fp_cache: dict, threshold: float) -> tuple[list, list, list]:
+                     fp_cache: dict, threshold: float) -> tuple[list, list, list, list]:
     """
     Run fingerprint matching on files that had no filename/metadata match.
 
     For each no-match file:
       1. Generate its fingerprint (or load from cache)
-      2. Compare against all organized library fingerprints
-      3. If best similarity >= threshold, categorise as duplicate or better
+      2. Skip if fingerprint is degenerate (too short)
+      3. Compare against all organized library fingerprints
+      4. If best similarity >= threshold, categorise as duplicate or better
 
-    Returns (new_duplicates, new_better, still_no_match).
+    Returns (new_duplicates, new_better, still_no_match, high_freq_warnings).
+    high_freq_warnings = list of (organized_path, match_count) for library files
+    that matched an unusually high number of unsorted files (possible bad fingerprint).
     """
     new_duplicates = []
     new_better     = []
     still_no_match = []
+
+    # Track how many times each organized file is matched
+    match_counts: dict[str, int] = {}
 
     pbar = make_pbar(len(no_match_items), "Fingerprint matching", "file")
 
@@ -824,6 +925,10 @@ def fingerprint_pass(no_match_items: list, org_fp_index: list, fpcalc_path: str,
 
         fp_u = fp_cache.get(path_str) or get_fingerprint(u["path"], fpcalc_path)
         if fp_u:
+            if not is_valid_fingerprint(fp_u):
+                still_no_match.append(item)
+                pbar.update(1)
+                continue
             fp_cache[path_str] = fp_u
 
         best_match = None
@@ -838,11 +943,15 @@ def fingerprint_pass(no_match_items: list, org_fp_index: list, fpcalc_path: str,
                         best_match = entry["file"]
 
         if best_match:
+            org_path_str = str(best_match["path"])
+            match_counts[org_path_str] = match_counts.get(org_path_str, 0) + 1
+
             method     = f"audio fingerprint ({best_score:.0f}% match)"
             match_item = {
                 "unsorted":      u,
                 "match":         best_match,
                 "match_method":  method,
+                "fp_score":      best_score,
                 "why_not_exact": "matched by fingerprint only (different filename/tags)",
             }
             u_br = u["metadata"].get("bitrate") or 0
@@ -857,7 +966,14 @@ def fingerprint_pass(no_match_items: list, org_fp_index: list, fpcalc_path: str,
         pbar.update(1)
 
     pbar.close()
-    return new_duplicates, new_better, still_no_match
+
+    # Build high-frequency warnings
+    high_freq_warnings = [
+        (path, count) for path, count in match_counts.items()
+        if count >= FP_HIGH_FREQ_THRESHOLD
+    ]
+
+    return new_duplicates, new_better, still_no_match, high_freq_warnings
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1021,11 +1137,14 @@ def main():
     # ── Handle CLI flags ──
     if CLEAR_CACHE:
         Path(CACHE_FILE).unlink(missing_ok=True)
-        print("Cache cleared.")
+        print("Metadata cache cleared.")
+    if CLEAR_FP_CACHE:
+        Path(FP_CACHE_FILE).unlink(missing_ok=True)
+        print("Fingerprint cache cleared.")
     if CLEAR_RESUME:
         clear_resume(RESUME_FILE)
         print("Resume state cleared.")
-    if CLEAR_CACHE or CLEAR_RESUME:
+    if CLEAR_CACHE or CLEAR_FP_CACHE or CLEAR_RESUME:
         if len(sys.argv) == 2:
             return
 
@@ -1100,9 +1219,11 @@ def main():
 
     # ── Initialise resume state ──
     if resume_state is None and RESUME_ENABLED:
-        resume_state = {"processed": set(), "mode": mode}
+        resume_state = {"processed": set(), "mode": mode, "fp_processed": set()}
     elif resume_state:
         resume_state["mode"] = mode
+        if "fp_processed" not in resume_state:
+            resume_state["fp_processed"] = set()
 
     # ── Categorise by filename / metadata ──
     print()
@@ -1112,19 +1233,34 @@ def main():
     fp_cache    = {}
     fp_log_info = ""
     if use_fingerprints and cats["no_match"]:
-        fp_cache = load_cache(FP_CACHE_FILE)
-        print(f"\n  Fingerprint cache loaded: {len(fp_cache)} entries.")
+        if CLEAR_FP_CACHE:
+            fp_cache = {}
+            print(f"\n  Fingerprint cache cleared — will regenerate all fingerprints.")
+        else:
+            fp_cache = load_cache(FP_CACHE_FILE)
+            print(f"\n  Fingerprint cache loaded: {len(fp_cache)} entries.")
         print()
 
-        org_fp_index = build_fp_index(organized_files, FPCALC_PATH, fp_cache)
+        org_fp_index, fp_index_warnings = build_fp_index(organized_files, FPCALC_PATH, fp_cache)
         print(f"  Library fingerprints ready: {len(org_fp_index)} files.")
+        if fp_index_warnings:
+            print(f"  WARNING: {len(fp_index_warnings)} library file(s) skipped due to invalid fingerprints:")
+            for warn_path, warn_reason in fp_index_warnings:
+                print(f"    ! {Path(warn_path).name} — {warn_reason}")
         print()
 
-        fp_dups, fp_better, fp_no_match = fingerprint_pass(
+        fp_dups, fp_better, fp_no_match, fp_high_freq = fingerprint_pass(
             cats["no_match"], org_fp_index, FPCALC_PATH, fp_cache, FP_SIMILARITY_THRESHOLD
         )
 
         save_cache(fp_cache, FP_CACHE_FILE)
+
+        # Warn about high-frequency matches (possible bad fingerprints)
+        if fp_high_freq:
+            print(f"\n  WARNING: {len(fp_high_freq)} library file(s) matched an unusually high number of unsorted files.")
+            print(f"  These may have corrupted or degenerate fingerprints — review their matches carefully:")
+            for hf_path, hf_count in sorted(fp_high_freq, key=lambda x: -x[1]):
+                print(f"    ! {Path(hf_path).name} — matched {hf_count} unsorted files")
 
         cats["duplicate"].extend(fp_dups)
         cats["better"].extend(fp_better)
@@ -1189,43 +1325,82 @@ def main():
         print(f"\n  {len(cats['exact'])} exact match(es) {verb} to Duplicates folder.")
 
     # ── Step 1: Standard duplicates ──
+    # Split into fingerprint matches (tiered review) and metadata matches (single list)
     dup_selected = set()
     if cats["duplicate"]:
-        content = build_notepad_list(
-            "STANDARD DUPLICATES", cats["duplicate"],
-            f"Match mode: {mode_label_str}", DRY_RUN,
-        )
-        tmp1 = open_in_notepad(content)
-        print("\n  Standard duplicates list opened in Notepad.")
-        dup_selected = prompt_selection(
-            "Select standard duplicates to move to Duplicates folder:",
-            cats["duplicate"],
-        )
-        try:
-            os.remove(tmp1)
-        except Exception:
-            pass
+        fp_dup_indices   = [i for i, item in enumerate(cats["duplicate"]) if item.get("fp_score")]
+        meta_dup_indices = [i for i in range(len(cats["duplicate"])) if i not in fp_dup_indices]
+        meta_dups        = [cats["duplicate"][i] for i in meta_dup_indices]
+
+        # Metadata duplicates — single Notepad list as before
+        if meta_dups:
+            content = build_notepad_list(
+                "STANDARD DUPLICATES (filename/metadata match)", meta_dups,
+                f"Match mode: {mode_label_str}", DRY_RUN,
+            )
+            tmp1 = open_in_notepad(content)
+            print("\n  Standard duplicates list opened in Notepad.")
+            selected_sub = prompt_selection(
+                "Select standard duplicates to move to Duplicates folder:",
+                meta_dups,
+            )
+            try:
+                os.remove(tmp1)
+            except Exception:
+                pass
+            # Map sub-indices back to cats["duplicate"] indices
+            for sub_idx in selected_sub:
+                dup_selected.add(meta_dup_indices[sub_idx])
+        else:
+            print("\n  No metadata-matched duplicates to review.")
+
+        # Fingerprint duplicates — tiered Notepad lists
+        if fp_dup_indices:
+            print(f"\n  Fingerprint duplicates: {len(fp_dup_indices)} file(s) — reviewing by confidence tier.")
+            fp_selected = prompt_fp_tiered_selection(
+                "FINGERPRINT DUPLICATES", cats["duplicate"], fp_dup_indices
+            )
+            dup_selected.update(fp_selected)
     else:
         print("\n  No standard duplicates to review.")
 
     # ── Step 2: Higher quality matches ──
+    # Same split: fingerprint matches get tiered review, metadata matches get single list
     better_selected = set()
     if cats["better"]:
-        content2 = build_notepad_list(
-            "HIGHER QUALITY MATCHES (unsorted is higher bitrate)",
-            cats["better"],
-            f"These will be moved to: {BETTER_QUALITY_FOLDER}", DRY_RUN,
-        )
-        tmp2 = open_in_notepad(content2)
-        print("\n  Higher quality matches list opened in Notepad.")
-        better_selected = prompt_selection(
-            "Select higher quality files to move to Better Quality folder:",
-            cats["better"],
-        )
-        try:
-            os.remove(tmp2)
-        except Exception:
-            pass
+        fp_better_indices   = [i for i, item in enumerate(cats["better"]) if item.get("fp_score")]
+        meta_better_indices = [i for i in range(len(cats["better"])) if i not in fp_better_indices]
+        meta_better         = [cats["better"][i] for i in meta_better_indices]
+
+        # Metadata better quality — single list
+        if meta_better:
+            content2 = build_notepad_list(
+                "HIGHER QUALITY MATCHES (filename/metadata match)",
+                meta_better,
+                f"These will be moved to: {BETTER_QUALITY_FOLDER}", DRY_RUN,
+            )
+            tmp2 = open_in_notepad(content2)
+            print("\n  Higher quality matches list opened in Notepad.")
+            selected_sub2 = prompt_selection(
+                "Select higher quality files to move to Better Quality folder:",
+                meta_better,
+            )
+            try:
+                os.remove(tmp2)
+            except Exception:
+                pass
+            for sub_idx in selected_sub2:
+                better_selected.add(meta_better_indices[sub_idx])
+        else:
+            print("\n  No metadata-matched higher quality files to review.")
+
+        # Fingerprint better quality — tiered lists
+        if fp_better_indices:
+            print(f"\n  Fingerprint higher quality: {len(fp_better_indices)} file(s) — reviewing by confidence tier.")
+            fp_better_sel = prompt_fp_tiered_selection(
+                "FINGERPRINT HIGHER QUALITY", cats["better"], fp_better_indices
+            )
+            better_selected.update(fp_better_sel)
     else:
         print("\n  No higher quality matches to review.")
 
