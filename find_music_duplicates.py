@@ -107,6 +107,14 @@ CLEAR_FP_CACHE   = "--clear-fp-cache"  in sys.argv
 _cfg_flag = next((sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--config" and i + 1 < len(sys.argv)), None)
 CONFIG_FILE = _cfg_flag or DEFAULT_CONFIG_FILE
 
+# Parse --confirm flag  (path to a dry-run CSV to use as selection source)
+_confirm_flag = next(
+    (sys.argv[i + 1] for i, a in enumerate(sys.argv)
+     if a == "--confirm" and i + 1 < len(sys.argv)),
+    None,
+)
+CONFIRM_CSV = _confirm_flag
+
 
 def load_config(path: str) -> dict:
     """Load and validate the JSON config file."""
@@ -980,6 +988,48 @@ def fingerprint_pass(no_match_items: list, org_fp_index: list, fpcalc_path: str,
 #  CSV REPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def load_confirm_csv(confirm_path: str) -> tuple[set[str], set[str]]:
+    """
+    Read a dry-run CSV report and return the unsorted paths the user selected.
+
+    Returns (dup_paths, better_paths) — sets of Unsorted Path strings for
+    rows where the action was "Would move to DUPLICATE" or
+    "Would move to BETTER QUALITY".
+
+    Raises SystemExit if the CSV is not a dry-run report.
+    """
+    p = Path(confirm_path.strip('"'))
+    if not p.exists():
+        print(f"ERROR: Confirm CSV not found: {p}")
+        sys.exit(1)
+
+    # Warn if filename doesn't contain 'dry' — may be a live run report
+    if "_live_" in p.name.lower():
+        print(f"ERROR: '{p.name}' appears to be a live run report, not a dry run.")
+        print(f"       --confirm only accepts dry-run CSV reports.")
+        sys.exit(1)
+
+    dup_paths    = set()
+    better_paths = set()
+
+    with open(p, encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            action = row.get("Action", "").strip().lower()
+            path   = row.get("Unsorted Path", "").strip()
+            if not path:
+                continue
+            if "would move to duplicate" in action:
+                dup_paths.add(path)
+            elif "would move to better quality" in action:
+                better_paths.add(path)
+
+    if not dup_paths and not better_paths:
+        print(f"WARNING: No selected moves found in '{p.name}'.")
+        print(f"         Make sure this CSV is from a dry run where you made selections.")
+
+    return dup_paths, better_paths
+
+
 def write_csv_report(csv_path: str, all_rows: list, mode_label: str, run_label: str, timestamp: str):
     fieldnames = [
         "Run Mode", "Timestamp", "Match Mode",
@@ -1183,6 +1233,11 @@ def main():
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_label = "DRY RUN" if DRY_RUN else "LIVE RUN"
 
+    # Build descriptive filename suffix: e.g. dry_mode4_fp or live_mode4
+    _run_slug = "dry" if DRY_RUN else "live"
+    _fp_slug  = "_fp" if use_fingerprints else ""
+    _file_suffix = f"{_run_slug}_mode{mode}{_fp_slug}"
+
     print(f"  Threads          : {MAX_THREADS}")
     print(f"  Fuzzy match      : {'enabled (threshold: ' + str(FUZZY_THRESHOLD) + ')' if FUZZY_ENABLED else 'disabled'}")
     print(f"  Duration         : {'enabled (tolerance: ±' + str(DURATION_TOLERANCE) + 's)' if USE_DURATION else 'disabled'}")
@@ -1324,83 +1379,129 @@ def main():
         verb = "would be auto-moved" if DRY_RUN else "auto-moved"
         print(f"\n  {len(cats['exact'])} exact match(es) {verb} to Duplicates folder.")
 
+    # ── Load confirm CSV if --confirm was passed ──
+    confirm_dup_paths    = set()
+    confirm_better_paths = set()
+    if CONFIRM_CSV:
+        confirm_dup_paths, confirm_better_paths = load_confirm_csv(CONFIRM_CSV)
+        total_confirmed = len(confirm_dup_paths) + len(confirm_better_paths)
+        print(f"\n  Confirm mode: {total_confirmed} selection(s) loaded from dry-run CSV.")
+        print(f"    Duplicates    : {len(confirm_dup_paths)}")
+        print(f"    Better quality: {len(confirm_better_paths)}")
+        confirm_choice = input("\n  Proceed with these selections? (y/n): ").strip().lower()
+        while confirm_choice not in ("y", "n"):
+            confirm_choice = input("  Please enter y or n: ").strip().lower()
+        if confirm_choice != "y":
+            print("  Aborted.")
+            return
+
     # ── Step 1: Standard duplicates ──
     # Split into fingerprint matches (tiered review) and metadata matches (single list)
     dup_selected = set()
     if cats["duplicate"]:
-        fp_dup_indices   = [i for i, item in enumerate(cats["duplicate"]) if item.get("fp_score")]
-        meta_dup_indices = [i for i in range(len(cats["duplicate"])) if i not in fp_dup_indices]
-        meta_dups        = [cats["duplicate"][i] for i in meta_dup_indices]
-
-        # Metadata duplicates — single Notepad list as before
-        if meta_dups:
-            content = build_notepad_list(
-                "STANDARD DUPLICATES (filename/metadata match)", meta_dups,
-                f"Match mode: {mode_label_str}", DRY_RUN,
-            )
-            tmp1 = open_in_notepad(content)
-            print("\n  Standard duplicates list opened in Notepad.")
-            selected_sub = prompt_selection(
-                "Select standard duplicates to move to Duplicates folder:",
-                meta_dups,
-            )
-            try:
-                os.remove(tmp1)
-            except Exception:
-                pass
-            # Map sub-indices back to cats["duplicate"] indices
-            for sub_idx in selected_sub:
-                dup_selected.add(meta_dup_indices[sub_idx])
+        if CONFIRM_CSV:
+            # Auto-select based on dry-run CSV — verify each file still exists
+            missing = []
+            for i, item in enumerate(cats["duplicate"]):
+                u_path = str(item["unsorted"]["path"])
+                if u_path in confirm_dup_paths:
+                    if Path(u_path).exists():
+                        dup_selected.add(i)
+                    else:
+                        missing.append(u_path)
+            if missing:
+                print(f"\n  WARNING: {len(missing)} file(s) from dry-run CSV no longer exist and will be skipped:")
+                for m in missing:
+                    print(f"    ! {Path(m).name}")
+            print(f"\n  {len(dup_selected)} duplicate(s) auto-selected from dry-run CSV.")
         else:
-            print("\n  No metadata-matched duplicates to review.")
+            fp_dup_indices   = [i for i, item in enumerate(cats["duplicate"]) if item.get("fp_score")]
+            meta_dup_indices = [i for i in range(len(cats["duplicate"])) if i not in fp_dup_indices]
+            meta_dups        = [cats["duplicate"][i] for i in meta_dup_indices]
 
-        # Fingerprint duplicates — tiered Notepad lists
-        if fp_dup_indices:
-            print(f"\n  Fingerprint duplicates: {len(fp_dup_indices)} file(s) — reviewing by confidence tier.")
-            fp_selected = prompt_fp_tiered_selection(
-                "FINGERPRINT DUPLICATES", cats["duplicate"], fp_dup_indices
-            )
-            dup_selected.update(fp_selected)
+            # Metadata duplicates — single Notepad list as before
+            if meta_dups:
+                content = build_notepad_list(
+                    "STANDARD DUPLICATES (filename/metadata match)", meta_dups,
+                    f"Match mode: {mode_label_str}", DRY_RUN,
+                )
+                tmp1 = open_in_notepad(content)
+                print("\n  Standard duplicates list opened in Notepad.")
+                selected_sub = prompt_selection(
+                    "Select standard duplicates to move to Duplicates folder:",
+                    meta_dups,
+                )
+                try:
+                    os.remove(tmp1)
+                except Exception:
+                    pass
+                for sub_idx in selected_sub:
+                    dup_selected.add(meta_dup_indices[sub_idx])
+            else:
+                print("\n  No metadata-matched duplicates to review.")
+
+            # Fingerprint duplicates — tiered Notepad lists
+            if fp_dup_indices:
+                print(f"\n  Fingerprint duplicates: {len(fp_dup_indices)} file(s) — reviewing by confidence tier.")
+                fp_selected = prompt_fp_tiered_selection(
+                    "FINGERPRINT DUPLICATES", cats["duplicate"], fp_dup_indices
+                )
+                dup_selected.update(fp_selected)
     else:
         print("\n  No standard duplicates to review.")
 
     # ── Step 2: Higher quality matches ──
-    # Same split: fingerprint matches get tiered review, metadata matches get single list
     better_selected = set()
     if cats["better"]:
-        fp_better_indices   = [i for i, item in enumerate(cats["better"]) if item.get("fp_score")]
-        meta_better_indices = [i for i in range(len(cats["better"])) if i not in fp_better_indices]
-        meta_better         = [cats["better"][i] for i in meta_better_indices]
-
-        # Metadata better quality — single list
-        if meta_better:
-            content2 = build_notepad_list(
-                "HIGHER QUALITY MATCHES (filename/metadata match)",
-                meta_better,
-                f"These will be moved to: {BETTER_QUALITY_FOLDER}", DRY_RUN,
-            )
-            tmp2 = open_in_notepad(content2)
-            print("\n  Higher quality matches list opened in Notepad.")
-            selected_sub2 = prompt_selection(
-                "Select higher quality files to move to Better Quality folder:",
-                meta_better,
-            )
-            try:
-                os.remove(tmp2)
-            except Exception:
-                pass
-            for sub_idx in selected_sub2:
-                better_selected.add(meta_better_indices[sub_idx])
+        if CONFIRM_CSV:
+            # Auto-select based on dry-run CSV — verify each file still exists
+            missing_better = []
+            for i, item in enumerate(cats["better"]):
+                u_path = str(item["unsorted"]["path"])
+                if u_path in confirm_better_paths:
+                    if Path(u_path).exists():
+                        better_selected.add(i)
+                    else:
+                        missing_better.append(u_path)
+            if missing_better:
+                print(f"\n  WARNING: {len(missing_better)} better quality file(s) from dry-run CSV no longer exist and will be skipped:")
+                for m in missing_better:
+                    print(f"    ! {Path(m).name}")
+            print(f"\n  {len(better_selected)} better quality file(s) auto-selected from dry-run CSV.")
         else:
-            print("\n  No metadata-matched higher quality files to review.")
+            fp_better_indices   = [i for i, item in enumerate(cats["better"]) if item.get("fp_score")]
+            meta_better_indices = [i for i in range(len(cats["better"])) if i not in fp_better_indices]
+            meta_better         = [cats["better"][i] for i in meta_better_indices]
 
-        # Fingerprint better quality — tiered lists
-        if fp_better_indices:
-            print(f"\n  Fingerprint higher quality: {len(fp_better_indices)} file(s) — reviewing by confidence tier.")
-            fp_better_sel = prompt_fp_tiered_selection(
-                "FINGERPRINT HIGHER QUALITY", cats["better"], fp_better_indices
-            )
-            better_selected.update(fp_better_sel)
+            # Metadata better quality — single list
+            if meta_better:
+                content2 = build_notepad_list(
+                    "HIGHER QUALITY MATCHES (filename/metadata match)",
+                    meta_better,
+                    f"These will be moved to: {BETTER_QUALITY_FOLDER}", DRY_RUN,
+                )
+                tmp2 = open_in_notepad(content2)
+                print("\n  Higher quality matches list opened in Notepad.")
+                selected_sub2 = prompt_selection(
+                    "Select higher quality files to move to Better Quality folder:",
+                    meta_better,
+                )
+                try:
+                    os.remove(tmp2)
+                except Exception:
+                    pass
+                for sub_idx in selected_sub2:
+                    better_selected.add(meta_better_indices[sub_idx])
+            else:
+                print("\n  No metadata-matched higher quality files to review.")
+
+            # Fingerprint better quality — tiered lists
+            if fp_better_indices:
+                print(f"\n  Fingerprint higher quality: {len(fp_better_indices)} file(s) — reviewing by confidence tier.")
+                fp_better_sel = prompt_fp_tiered_selection(
+                    "FINGERPRINT HIGHER QUALITY", cats["better"], fp_better_indices
+                )
+                better_selected.update(fp_better_sel)
     else:
         print("\n  No higher quality matches to review.")
 
@@ -1412,8 +1513,8 @@ def main():
         if better_selected:
             better_folder.mkdir(parents=True, exist_ok=True)
 
-    log_path = str(log_folder / f"music_log_{timestamp}.txt")
-    csv_path = str(log_folder / f"music_report_{timestamp}.csv")
+    log_path = str(log_folder / f"music_log_{timestamp}_{_file_suffix}.txt")
+    csv_path = str(log_folder / f"music_report_{timestamp}_{_file_suffix}.csv")
 
     logging.basicConfig(
         level=logging.INFO,

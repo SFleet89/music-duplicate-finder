@@ -4,8 +4,16 @@ python find_music_duplicates.py --clear-cache        # force re-scan of organize
 python find_music_duplicates.py --clear-fp-cache     # delete fingerprint cache and regenerate on next run
 python find_music_duplicates.py --clear-resume       # discard interrupted run state
 python find_music_duplicates.py --config other.json  # use a different config file
+python find_music_duplicates.py --confirm "music_report_20260304_200225_dry_mode4_fp.csv"  # live run using dry-run selections
 
 # Combinations
 python find_music_duplicates.py --dry-run --clear-fp-cache        # fresh fingerprints, preview only
 python find_music_duplicates.py --dry-run --clear-cache           # fresh metadata scan, preview only
 python find_music_duplicates.py --clear-cache --clear-fp-cache    # wipe both caches and exit
+python find_music_duplicates.py --confirm "music_report_20260304_200225_dry_mode4_fp.csv" --clear-cache  # confirm run with fresh cache
+
+# Recommended workflow
+# Step 1 — dry run and make selections:
+python find_music_duplicates.py --dry-run
+# Step 2 — commit those exact selections as a live run:
+python find_music_duplicates.py --confirm "music_report_YYYYMMDD_HHMMSS_dry_mode4_fp.csv"

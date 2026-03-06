@@ -4,6 +4,19 @@ All notable changes to Music Duplicate Finder are documented here.
 
 ---
 
+## [3.3] - 2026-03-06
+
+### Added
+- **`--confirm` flag** — takes a dry-run CSV as input and executes those exact selections as a live run, skipping all Notepad review prompts. Recommended workflow: do your dry run, review carefully, then run with `--confirm` to commit without re-reviewing.
+  ```
+  python find_music_duplicates.py --confirm "music_report_20260304_200225_dry_mode4_fp.csv"
+  ```
+- **Descriptive report filenames** — log and CSV filenames now include run type, match mode, and whether fingerprinting was used, e.g. `music_report_20260304_200225_dry_mode4_fp.csv`. Makes it easy to identify reports at a glance and avoids accidentally passing a live run report to `--confirm`.
+- **Missing file verification in confirm mode** — before executing each selection from the dry-run CSV, the script verifies the unsorted file still exists. Files that have moved or been deleted since the dry run are skipped with a warning rather than causing an error.
+- **Safety check on confirm CSV** — if the filename contains `_live_`, the script refuses to use it and exits with an error explaining that `--confirm` only accepts dry-run reports.
+
+---
+
 ## [3.2] - 2026-03-04
 
 ### Added
