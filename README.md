@@ -23,6 +23,20 @@ Exact matches are the only thing that moves automatically. Everything else goes 
 
 ---
 
+## Recommended workflow
+
+```
+# Step 1 — dry run, review all matches, make your selections
+python find_music_duplicates.py --dry-run
+
+# Step 2 — commit those exact selections as a live run (no re-reviewing)
+python find_music_duplicates.py --confirm "music_report_20260304_200225_dry_mode4_fp.csv"
+```
+
+The `--confirm` flag reads the selections you made in the dry run and executes them directly, skipping all Notepad prompts. It verifies each file still exists before moving anything, and shows a summary with a final y/n before starting.
+
+---
+
 ## Features
 
 - **Multi-threaded scanning** — reads metadata in parallel, 3–4x faster than single-threaded
@@ -33,6 +47,8 @@ Exact matches are the only thing that moves automatically. Everything else goes 
 - **"Why not auto" explanations** — Standard Duplicates show exactly why they didn't qualify for auto-move (e.g. `size diff: 2.5%`)
 - **AcoustID fingerprint matching** *(optional)* — compares actual audio content to catch renamed or retagged duplicates, with tiered confidence review
 - **Degenerate fingerprint detection** — automatically skips corrupted or silent library files that would otherwise produce false matches
+- **Confirm mode** — execute a dry run's selections as a live run without re-reviewing
+- **Descriptive report filenames** — reports are named with run type, mode, and fingerprint status for easy identification
 - **Resume capability** — picks up where it left off if interrupted
 - **Full CSV report** — every file, every decision, every run, all logged
 - **Dry run mode** — preview everything before moving a single file
@@ -86,6 +102,7 @@ Download `fpcalc` from [acoustid.org/chromaprint](https://acoustid.org/chromapri
 ```
 python find_music_duplicates.py                    # normal run
 python find_music_duplicates.py --dry-run          # preview only, nothing moves
+python find_music_duplicates.py --confirm "report.csv"  # live run from dry-run selections
 python find_music_duplicates.py --clear-cache      # force re-scan of organized folder
 python find_music_duplicates.py --clear-fp-cache   # delete fingerprint cache and regenerate
 python find_music_duplicates.py --clear-resume     # discard saved resume state
@@ -96,6 +113,7 @@ Flags can be combined:
 ```
 python find_music_duplicates.py --clear-fp-cache --dry-run
 python find_music_duplicates.py --clear-cache --clear-fp-cache
+python find_music_duplicates.py --confirm "report.csv" --clear-cache
 ```
 
 On each run you'll be asked:
@@ -103,6 +121,22 @@ On each run you'll be asked:
 2. Whether to run **audio fingerprint matching** (if enabled in config)
 3. Which **Standard Duplicates** to move (via a Notepad review list)
 4. Which **Higher Quality** files to move
+
+In `--confirm` mode, steps 3 and 4 are skipped — selections are loaded from the dry-run CSV instead.
+
+---
+
+## Report filenames
+
+Reports are named with enough context to identify them at a glance:
+
+```
+music_report_20260304_200225_dry_mode4_fp.csv    # dry run, mode 4, fingerprints on
+music_report_20260304_200225_dry_mode4.csv        # dry run, mode 4, no fingerprints
+music_report_20260304_200225_live_mode4_fp.csv    # live run, mode 4, fingerprints on
+```
+
+Only dry-run reports (`_dry_`) can be passed to `--confirm`. Passing a live run report will exit with an error.
 
 ---
 
@@ -179,10 +213,10 @@ python find_music_duplicates.py --clear-fp-cache
 `undo_duplicates.py` reads the CSV report from any previous run and moves files back to their original locations. See [undo_duplicates README](README_undo.md) for full details.
 
 ```
-python undo_duplicates.py "C:\Music\Duplicates\music_report_20260228_120000.csv"
-python undo_duplicates.py "C:\Music\Duplicates\music_report_20260228_120000.csv" --dry-run
-python undo_duplicates.py "C:\Music\Duplicates\music_report_20260228_120000.csv" --list-categories
-python undo_duplicates.py "C:\Music\Duplicates\music_report_20260228_120000.csv" --filter-category "Exact Match"
+python undo_duplicates.py "C:\Music\Duplicates\music_report_20260228_120000_live_mode4_fp.csv"
+python undo_duplicates.py "C:\Music\Duplicates\music_report_20260228_120000_live_mode4_fp.csv" --dry-run
+python undo_duplicates.py "C:\Music\Duplicates\music_report_20260228_120000_live_mode4_fp.csv" --list-categories
+python undo_duplicates.py "C:\Music\Duplicates\music_report_20260228_120000_live_mode4_fp.csv" --filter-category "Exact Match"
 ```
 
 ---
