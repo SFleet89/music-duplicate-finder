@@ -4,6 +4,19 @@ All notable changes to Music Duplicate Finder are documented here.
 
 ---
 
+## [3.4] - 2026-03-09
+
+### Added
+- **Fingerprint warnings CSV report** — when fingerprinting is run, any library files that produced invalid or failed fingerprints are now saved to a dedicated CSV alongside the main report: `music_fp_warnings_TIMESTAMP.csv`. Columns: Folder, Filename, Full Path, Reason, Fingerprint Length. Rows are sorted by reason so all generation failures group together and all short fingerprint files group together. The report is only created if there are warnings to report.
+- **Fingerprint warnings written to log file** — previously, the "WARNING: N library file(s) skipped due to invalid fingerprints" message was printed to the console only and lost after the session. It is now also written to the log file with full file paths, so every run's warnings are permanently recorded.
+- **High-frequency match warnings written to log file** — same fix applied to the high-frequency match warning (a library file matching 5+ unsorted files). Previously console-only, now also captured in the log with full paths.
+- **Fingerprint warning count in summary** — the run summary at the bottom of the log now includes a line noting how many files had invalid fingerprints and the name of the warnings CSV, e.g. `FP warnings  : 140 file(s) — see music_fp_warnings_20260309_...csv`.
+
+### Fixed
+- **`acoustid` config section missing from `music_config.json`** — the config file was missing the `acoustid` block entirely, causing fingerprint matching to never be offered regardless of whether fpcalc was installed. The section has been added with `enabled: true`, `fpcalc_path`, `similarity_threshold`, and `fp_cache_file`.
+
+---
+
 ## [3.3] - 2026-03-06
 
 ### Added
@@ -41,7 +54,7 @@ All notable changes to Music Duplicate Finder are documented here.
 - **`Why Not Exact` and `Match Method` CSV columns** — every row in the report now records how the match was found and why it wasn't auto-moved.
 
 ### Changed
-- **Exact match size tolerance increased from 0.5% to 3.0%** — files at the same bitrate frequently differ slightly in size due to embedded artwork and tag overhead. The previous 0.5% threshold was causing 9 valid exact matches to fall through to Standard Duplicates requiring manual review.
+- **Exact match size tolerance increased from 0.5% to 3.0%** — files at the same bitrate frequently differ slightly in size due to embedded artwork and tag overhead. The previous 0.5% threshold was causing valid exact matches to fall through to Standard Duplicates requiring manual review.
 - **Quality detection changed to bitrate-only** — `unsorted_is_better()` previously used file size as a proxy for quality. Changed to compare bitrate only, since size differences at the same bitrate are tag/artwork noise rather than audio quality differences.
 
 ### Fixed

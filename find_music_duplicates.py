@@ -1030,6 +1030,37 @@ def load_confirm_csv(confirm_path: str) -> tuple[set[str], set[str]]:
     return dup_paths, better_paths
 
 
+def write_fp_warnings_csv(csv_path: str, warnings: list, organized_root: Path):
+    """Write a CSV report of files that failed or produced invalid fingerprints."""
+    import re as _re
+    fieldnames = ["Folder", "Filename", "Full Path", "Reason", "Fingerprint Length"]
+    rows = []
+    for path_str, reason in warnings:
+        p = Path(path_str)
+        try:
+            folder = str(p.parent.relative_to(organized_root))
+        except ValueError:
+            folder = str(p.parent)
+        # Extract integer count from reason string if present
+        m = _re.search(r'\((\d+) integers?\)', reason)
+        fp_len = int(m.group(1)) if m else ""
+        # Clean reason text — strip the integer count since it's in its own column
+        clean_reason = _re.sub(r'\s*\(\d+ integers?\)', '', reason).strip()
+        rows.append({
+            "Folder":               folder,
+            "Filename":             p.name,
+            "Full Path":            path_str,
+            "Reason":               clean_reason,
+            "Fingerprint Length":   fp_len,
+        })
+    # Sort by reason then folder
+    rows.sort(key=lambda r: (r["Reason"], r["Folder"], r["Filename"]))
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def write_csv_report(csv_path: str, all_rows: list, mode_label: str, run_label: str, timestamp: str):
     fieldnames = [
         "Run Mode", "Timestamp", "Match Mode",
@@ -1285,8 +1316,10 @@ def main():
     cats = categorise(unsorted_files, organized_index, mode, already_processed)
 
     # ── Optional fingerprint pass on no-match files ──
-    fp_cache    = {}
-    fp_log_info = ""
+    fp_cache               = {}
+    fp_log_info            = ""
+    _fp_index_warnings     = []
+    _fp_high_freq_warnings = []
     if use_fingerprints and cats["no_match"]:
         if CLEAR_FP_CACHE:
             fp_cache = {}
@@ -1302,6 +1335,7 @@ def main():
             print(f"  WARNING: {len(fp_index_warnings)} library file(s) skipped due to invalid fingerprints:")
             for warn_path, warn_reason in fp_index_warnings:
                 print(f"    ! {Path(warn_path).name} — {warn_reason}")
+        _fp_index_warnings = fp_index_warnings   # saved for log file
         print()
 
         fp_dups, fp_better, fp_no_match, fp_high_freq = fingerprint_pass(
@@ -1316,6 +1350,7 @@ def main():
             print(f"  These may have corrupted or degenerate fingerprints — review their matches carefully:")
             for hf_path, hf_count in sorted(fp_high_freq, key=lambda x: -x[1]):
                 print(f"    ! {Path(hf_path).name} — matched {hf_count} unsorted files")
+        _fp_high_freq_warnings = fp_high_freq   # saved for log file
 
         cats["duplicate"].extend(fp_dups)
         cats["better"].extend(fp_better)
@@ -1546,6 +1581,21 @@ def main():
     if fp_log_info:
         log.info(f"  {fp_log_info}\n")
 
+    if _fp_index_warnings:
+        log.info(f"  WARNING: {len(_fp_index_warnings)} library file(s) skipped due to invalid fingerprints:")
+        for warn_path, warn_reason in _fp_index_warnings:
+            log.info(f"    ! {Path(warn_path).name} — {warn_reason}")
+            log.info(f"      Full path: {warn_path}")
+        log.info("")
+
+    if _fp_high_freq_warnings:
+        log.info(f"  WARNING: {len(_fp_high_freq_warnings)} library file(s) matched an unusually high number of unsorted files.")
+        log.info(f"  These may have corrupted or degenerate fingerprints — review their matches carefully:")
+        for hf_path, hf_count in sorted(_fp_high_freq_warnings, key=lambda x: -x[1]):
+            log.info(f"    ! {Path(hf_path).name} — matched {hf_count} unsorted files")
+            log.info(f"      Full path: {hf_path}")
+        log.info("")
+
     # Log exact matches
     if auto_log_lines:
         log.info("── EXACT MATCHES (auto-moved) ──\n")
@@ -1601,6 +1651,12 @@ def main():
             os.makedirs(str(log_folder), exist_ok=True)
         write_csv_report(csv_path, all_csv_rows, mode_label_str, run_label, timestamp)
         log.info(f"\nCSV report saved to: {csv_path}")
+
+        # Invalid fingerprints report — only if there were any
+        if _fp_index_warnings:
+            fp_warn_csv_path = str(log_folder / f"music_fp_warnings_{timestamp}_{_file_suffix}.csv")
+            write_fp_warnings_csv(fp_warn_csv_path, _fp_index_warnings, organized)
+            log.info(f"Fingerprint warnings saved to: {fp_warn_csv_path}")
     except Exception as e:
         log.info(f"\nWARNING: Could not write CSV report: {e}")
 
@@ -1626,6 +1682,8 @@ def main():
         log.info(f"  Higher quality files moved        : {moved_better}")
     log.info(f"\n  Log saved to : {log_path}")
     log.info(f"  CSV saved to : {csv_path}")
+    if _fp_index_warnings:
+        log.info(f"  FP warnings  : {len(_fp_index_warnings)} file(s) — see music_fp_warnings_{timestamp}_{_file_suffix}.csv")
     log.info("=" * 60)
 
 

@@ -2,8 +2,6 @@
 
 Got music scattered across old phones, hard drives, and download folders? This tool compares your unsorted collection against your organized library and helps you clean up duplicates safely — with a review step before anything moves, and full undo support if you change your mind.
 
-A Python script that compares an unsorted music folder against an organized library, identifies duplicates, and helps you clean them up — without ever blindly deleting anything.
-
 Built for people who have accumulated music across multiple devices, downloads, and backups over the years and need a safe, reviewable way to deduplicate without losing anything important.
 
 ---
@@ -39,7 +37,7 @@ The `--confirm` flag reads the selections you made in the dry run and executes t
 
 ## Features
 
-- **Multi-threaded scanning** — reads metadata in parallel, 3–4x faster than single-threaded
+- **Multi-threaded scanning** — reads metadata in parallel, 3–4× faster than single-threaded
 - **Organized folder caching** — skips re-scanning unchanged files on subsequent runs
 - **Fuzzy metadata matching** — catches slight tag inconsistencies (`"The All-American Rejects"` vs `"All-American Rejects"`)
 - **Duration matching** — reduces false positives from songs that share a title but are different lengths
@@ -47,6 +45,7 @@ The `--confirm` flag reads the selections you made in the dry run and executes t
 - **"Why not auto" explanations** — Standard Duplicates show exactly why they didn't qualify for auto-move (e.g. `size diff: 2.5%`)
 - **AcoustID fingerprint matching** *(optional)* — compares actual audio content to catch renamed or retagged duplicates, with tiered confidence review
 - **Degenerate fingerprint detection** — automatically skips corrupted or silent library files that would otherwise produce false matches
+- **Fingerprint warnings report** — invalid fingerprint files saved to a dedicated CSV (`music_fp_warnings_*.csv`) for investigation
 - **Confirm mode** — execute a dry run's selections as a live run without re-reviewing
 - **Descriptive report filenames** — reports are named with run type, mode, and fingerprint status for easy identification
 - **Resume capability** — picks up where it left off if interrupted
@@ -90,7 +89,17 @@ Download `fpcalc` from [acoustid.org/chromaprint](https://acoustid.org/chromapri
    }
    ```
 
-3. Run:
+3. To enable fingerprint matching, make sure the `acoustid` section is present in your config:
+   ```json
+   "acoustid": {
+     "enabled": true,
+     "fpcalc_path": "fpcalc",
+     "similarity_threshold": 85,
+     "fp_cache_file": "music_fp_cache.json"
+   }
+   ```
+
+4. Run:
    ```
    python find_music_duplicates.py
    ```
@@ -100,13 +109,13 @@ Download `fpcalc` from [acoustid.org/chromaprint](https://acoustid.org/chromapri
 ## Usage
 
 ```
-python find_music_duplicates.py                    # normal run
-python find_music_duplicates.py --dry-run          # preview only, nothing moves
+python find_music_duplicates.py                         # normal run
+python find_music_duplicates.py --dry-run               # preview only, nothing moves
 python find_music_duplicates.py --confirm "report.csv"  # live run from dry-run selections
-python find_music_duplicates.py --clear-cache      # force re-scan of organized folder
-python find_music_duplicates.py --clear-fp-cache   # delete fingerprint cache and regenerate
-python find_music_duplicates.py --clear-resume     # discard saved resume state
-python find_music_duplicates.py --config my.json   # use a custom config file
+python find_music_duplicates.py --clear-cache           # force re-scan of organized folder
+python find_music_duplicates.py --clear-fp-cache        # delete fingerprint cache and regenerate
+python find_music_duplicates.py --clear-resume          # discard saved resume state
+python find_music_duplicates.py --config my.json        # use a custom config file
 ```
 
 Flags can be combined:
@@ -131,9 +140,10 @@ In `--confirm` mode, steps 3 and 4 are skipped — selections are loaded from th
 Reports are named with enough context to identify them at a glance:
 
 ```
-music_report_20260304_200225_dry_mode4_fp.csv    # dry run, mode 4, fingerprints on
-music_report_20260304_200225_dry_mode4.csv        # dry run, mode 4, no fingerprints
-music_report_20260304_200225_live_mode4_fp.csv    # live run, mode 4, fingerprints on
+music_report_20260304_200225_dry_mode4_fp.csv     # dry run, mode 4, fingerprints on
+music_report_20260304_200225_dry_mode4.csv         # dry run, mode 4, no fingerprints
+music_report_20260304_200225_live_mode4_fp.csv     # live run, mode 4, fingerprints on
+music_fp_warnings_20260304_200225_dry_mode4_fp.csv # invalid fingerprint warnings (if any)
 ```
 
 Only dry-run reports (`_dry_`) can be passed to `--confirm`. Passing a live run report will exit with an error.
@@ -164,10 +174,10 @@ All settings live in `music_config.json`. Key options:
 | `fuzzy_threshold` | `88` | 0–100, how similar tags must be |
 | `use_duration` | `true` | Include track length in matching |
 | `duration_tolerance_seconds` | `2` | Max duration difference to still match |
-| `exact_match_size_tolerance_percent` | `3.0` | Max size difference (%) for auto-move |
 | `max_threads` | `0` (auto) | Parallel threads for scanning |
 | `cache_enabled` | `true` | Cache organized folder metadata |
 | `acoustid.enabled` | `false` | Offer fingerprint matching each run |
+| `acoustid.fpcalc_path` | `"fpcalc"` | Path to fpcalc.exe |
 | `acoustid.similarity_threshold` | `85` | How similar fingerprints must be (0–100) |
 
 ---
@@ -195,11 +205,13 @@ Fingerprint matches are presented in three separate Notepad review lists grouped
 | Medium | 90–94% | Very likely duplicates, quick review recommended |
 | Low | 85–89% | Most scrutiny needed — false positives are possible here |
 
-### Fingerprint safety checks
+### Fingerprint warnings
 
 The script automatically warns you if:
 - A library file produces a **short or degenerate fingerprint** (fewer than 50 integers) — usually means the file is corrupted, silent, or too short to analyse reliably. It will be skipped and flagged at startup.
 - A library file matches an **unusually high number** of unsorted files (5 or more) — a strong signal of a bad fingerprint, flagged for investigation.
+
+Both warning types are printed to the console, written to the log file, and saved to a dedicated CSV report (`music_fp_warnings_*.csv`) with the file's full path and the specific reason. This report is only created if there are warnings to record.
 
 If you suspect the fingerprint cache contains bad data, clear it with:
 ```
@@ -234,6 +246,10 @@ MP3, FLAC, AAC, M4A
 | `find_music_duplicates.py` | Main script |
 | `undo_duplicates.py` | Restore files from a previous run |
 | `music_config.json` | All configuration settings |
+| `music_report_viewer.html` | Browser-based report viewer |
 | `music_cache.json` | Auto-generated metadata cache (organized folder) |
 | `music_fp_cache.json` | Auto-generated fingerprint cache (if fingerprinting used) |
 | `music_resume.json` | Auto-generated resume state (deleted on completion) |
+| `reports\music_report_*.csv` | Per-run duplicate report |
+| `reports\music_log_*.txt` | Per-run log file |
+| `reports\music_fp_warnings_*.csv` | Per-run invalid fingerprint report (if any) |
